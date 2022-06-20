@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-get_or_none = lambda d,key: d.get(key, None)
+get_or_none = lambda d, key: d.get(key, None)
 
 
 class RMSNorm(nn.Module):
@@ -48,7 +48,7 @@ class CausalConv(nn.Module):
             sz = self.context_size
         assert sz <= self.context_size
         # return nn.functional.pad(x, [sz, 0])
-        pad_param = self.pad_param[:, :sz].view(*(x.ndim - 2)*(1,), self.dim, -1).expand(*x.shape[:-2], -1, -1)
+        pad_param = self.pad_param[:, :sz].view(*(x.ndim - 2) * (1,), self.dim, -1).expand(*x.shape[:-2], -1, -1)
         return torch.cat((pad_param, x), -1)
 
     def forward_no_cache(self, x, return_cache=False):
@@ -111,14 +111,13 @@ class Block(nn.Module):
 
         x0 = x
 
-        x1, cache['pre_conv1'] = self.conv1.forward(x0, get_or_none(cache,'pre_conv1'), return_cache)
+        x1, cache['pre_conv1'] = self.conv1.forward(x0, get_or_none(cache, 'pre_conv1'), return_cache)
         x2 = self.norm1(x1)
         x3 = gelu(x2)
         if self.training and (self.dropout > 0):
             nn.functional.dropout(x3, p=self.dropout, inplace=True)
 
-
-        x4, cache['pre_conv2'] = self.conv2.forward(x3, get_or_none(cache,'pre_conv2'), return_cache)
+        x4, cache['pre_conv2'] = self.conv2.forward(x3, get_or_none(cache, 'pre_conv2'), return_cache)
         x5 = self.norm2(x4)
 
         x6 = x5 + x0
@@ -132,7 +131,8 @@ class Block(nn.Module):
 
 
 class ConvDecoder(nn.Module):
-    def __init__(self, dim=32, num_low_level_blocks=3, num_recurring_blocks=2, kernel_size=5, dropout=0.1):
+    def __init__(self, dim=32, num_low_level_blocks=3, num_recurring_blocks=2, kernel_size=5,
+                 depth_factor=1, dropout=0.1):
         nn.Module.__init__(self)
 
         conv_block = lambda: Block(kernel_size, dim, dropout=dropout)
@@ -142,8 +142,16 @@ class ConvDecoder(nn.Module):
             self.low_level_blocks.append(conv_block())
 
         self.recurring_blocks = nn.ModuleList()
+        recurring_context_size = 0
         for i in range(num_recurring_blocks):
-            self.recurring_blocks.append(conv_block())
+            block = conv_block()
+            self.recurring_blocks.append(block)
+            recurring_context_size += block.context_size
+
+        if depth_factor is None:
+            depth_factor = recurring_context_size // 2
+        assert depth_factor <= recurring_context_size
+        self.depth_factor = depth_factor
 
     def forward(self, x, cache=None, return_cache=False):
         if cache is not None:
@@ -153,16 +161,16 @@ class ConvDecoder(nn.Module):
 
         for i, block in enumerate(self.low_level_blocks):
             name = f'low_level_{i:d}'
-            x, cache[name] = block(x, get_or_none(cache,name), return_cache)
+            x, cache[name] = block(x, get_or_none(cache, name), return_cache)
 
-        cache['depth'] = cache.get('depth', 0)
-        seq_len = x.size(-1) + cache['depth']
-        # TODO: maybe, to reduce depth, use something like for i in range(seq_len/block.context_size)
-        for i in range(seq_len):
+        cache['seq_len'] = cache.get('seq_len', 0)
+        seq_len = x.size(-1) + cache['seq_len']
+        for i in range(0, seq_len, self.depth_factor):
             for j, block in enumerate(self.recurring_blocks):
                 name = f'recurring_level_{i:d}_{j:d}'
-                x[..., -(seq_len-i):], cache[name] = block(x[...,  -(seq_len-i):], get_or_none(cache,name), return_cache)
-        cache['depth'] = seq_len
+                x[..., -(seq_len - i):], cache[name] = block(x[..., -(seq_len - i):], get_or_none(cache, name),
+                                                             return_cache)
+        cache['seq_len'] = seq_len
 
         if not return_cache:
             cache = None
@@ -170,13 +178,13 @@ class ConvDecoder(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, num_tokens, dim=32, num_low_level_blocks=3, num_recurring_blocks=2, kernel_size=5, dropout=0.1):
+    def __init__(self, num_tokens, dim=32, num_low_level_blocks=3, num_recurring_blocks=2, kernel_size=5, depth_factor=None, dropout=0.1):
         nn.Module.__init__(self)
 
         self.embedding = nn.Embedding(num_tokens, dim)
-        self.decoder = ConvDecoder(dim, num_low_level_blocks, num_recurring_blocks, kernel_size, dropout)
+        self.decoder = ConvDecoder(dim, num_low_level_blocks, num_recurring_blocks, kernel_size, depth_factor, dropout)
         self.norm = RMSNorm(dim, axis=-2)
-        self.proj = nn.Linear(dim, num_tokens) # consider weight tying with embedding...
+        self.proj = nn.Linear(dim, num_tokens)  # consider weight tying with embedding...
 
         self.init_parameters()
 
@@ -189,7 +197,7 @@ class LanguageModel(nn.Module):
                     p.normal_(0.0, 0.02)
 
     def forward(self, x, targets=None, cache=None, return_cache=False):
-        x = self.embedding(x).transpose(-2,-1)
+        x = self.embedding(x).transpose(-2, -1)
         x, cache = self.decoder(x, cache, return_cache)
         x = self.norm(x)
         x.transpose_(-2, -1)
